@@ -1,0 +1,11 @@
+# Ignore everything
+*
+
+# But not these file types
+!*.cu
+!*.h
+!*.md
+!*.py
+
+# And not the SConstruct file
+!SConstruct
