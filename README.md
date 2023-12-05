@@ -85,7 +85,7 @@ out of a possible 112 TFLOP/s (fp16). What gives?
 The problem is that this single function calls *multiple kernels*. I haven't looked at exactly what
 kernels are launched, but it may be something like this:
 ```
-t0 = gemm(x, W1, b1)
+t0 = gemm(x, W1)
 t1 = add(t0, b1)
 t2 = sigmoid(t1)
 t3 = gemm(x, W2)
@@ -104,16 +104,57 @@ The problem is the kernel abstraction: Nvidia provides libraries that "do a thin
 full kernel that you call into. If you call `cublasGemmEx`, you *cannot* say "oh while you're doing that, also apply a sigmoid,"
 because it's just operating at *a different level of abstraction*.
 
-What we really want to do here is called *kernel fusion*. By designing a kernel to do the entire `forward`, function,
+What we really want to do here is called *kernel fusion*. By designing a kernel to do the entire `forward()`, function,
 we are able to reduce the number of kernel launches, and more importantly, *the total data movement*. 
 And that's just what we'll do in the next example.
 
 ### `6_gating_fused.py`
 
-TODOS:
-* explain Triton
+The most immediate problem we have with fusing together the kernels in `forward()` is that writing
+highly performant tensor core code in CUDA is hard.
+If we go with my ~8 TFLOP/s (fp16) implementation from `3_matmul_tensorcore.cu`, even if we fuse
+everything here into a single kernel, we will *still* underperform the aggregate 11 TFLOP/s
+that PyTorch gets.
+
+Fortunately we can use Triton to write our kernels instead. Triton is a library that lets
+us write kernels in Python. It is pretty flexible, but mostly useful when you're writing things
+that need to feed the tensor cores. As we saw in `3_matmul_tensorcore.cu`, efficiently
+utilizing them is difficult. Triton makes this part easy (it's just `tl.dot`), 
+and only forces the user to think about data movement instead.
+
+Looking at `fused_kernel()` in `6_gating_fused.py`, we first allocate
+two accumulator tiles `accum_w1` and `accum_w2`, then sweep across the
+matrix co-iteration dimension accumulating partial products into these
+accumulators.
+By the end of the loop, `accum_w1` represents a complete tile of the output matrix `x @ W1`
+and `accum_w2` represents a complete tile of `x @ W2`.
+The real magic comes in *after* the loop-- without ever writing back these tiles to main
+memory, we are able to add in the biases, apply the sigmoid, and elementwise
+multiply the results together.
+This greatly reduces data movement and results in a large speedup overall.
+
+`bonus_benchmark_fused.py` does the benchmarking more carefully, but this optimization achieves
+a ~2-3x speedup on my V100 while also providing substantial GPU memory savings.
+
+Importantly, this example shows that it is important to "pick your spots."
+It is impractical (and maybe impossible?) to achieve a speedup over
+cuBLAS's `cublasGemmEx` in general-- however, by taking a step back
+and looking at the application overall, we recognize some *large* inefficiencies.
+Once we've seen these large inefficiencies, we can use the proper tools (Triton)
+to *quickly* engineer a solution that is not "speed of light" fast, 
+but still handily beats the baseline.
 
 ### `bonus_matmul_A_stationary.cu`
 
+For the matrix multiplication dataflow enthusiasts in the crowd,
+this is just a quick demo of what a simple `A`-stationary matrix multiplication
+might look like.
+Because many separate blocks are contributing to the same element of the output matrix,
+we need to accumulate their updates with `atomicAdd`. This is predictably quite slow
+and inefficient, but necessary in this setting.
+More performant `A`-stationary implementations exist, but *in general* this dataflow
+is not very GPU friendly.
+
 ### `bonus_benchmark_fused.py`
 
+More rigurous benchmarking code for `6_gating_fused.py`.
