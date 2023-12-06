@@ -36,10 +36,7 @@ Note that this `cudaMemcpy` is very slow compared to most other GPU operations.
 Fundamentally, the CUDA programming model is built around a grid of `blocks`. Each
 block is in turn made up of multiple `threads`.
 
-TODOS:
-* how the CUDA grid works
-* threads
-* output stationarity
+![](./cuda-grid.png)
 
 ### `2_matmul_sharedmem.cu`
 
