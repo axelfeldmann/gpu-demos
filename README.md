@@ -33,6 +33,9 @@ Once `A_device`, `B_device`, and `C_device` have been allocated on the GPU,
 we use `cudaMemcpy` to transfer over the actual values of `A` and `B`.
 Note that this `cudaMemcpy` is very slow compared to most other GPU operations.
 
+Fundamentally, the CUDA programming model is built around a grid of `blocks`. Each
+block is in turn made up of multiple `threads`.
+
 TODOS:
 * how the CUDA grid works
 * threads
@@ -40,23 +43,88 @@ TODOS:
 
 ### `2_matmul_sharedmem.cu`
 
-TODOS:
-* tiling
-* what shared memory is
+Loading values from GPU main memory is expensive. In the kernel from `1_matmul_basic`,
+every multiply-accumulate looks like: `accum += A[row * N + i] * B[i * N + col]`--
+`A` and `B` are pointers to data that lives in the GPU's main memory.
+So, each multiply requires loading 2 values from memory! That's super expensive
+and will bottleneck our kernel.
+
+To speed things up, the GPU exposes a faster, software-managed scratchpad memory.
+It is called ``shared memory" because it is shared within  block.
+This is somewhat confusing because shared memory is *less shared* than GPU main memory
+which is shared across *all blocks*, but whatever.
+
+Accesses to shared memory are *vastly* cheaper than accesses to GPU main memory.
+However, they must be explicitly programmer.
+
+In this example, we first declare two buffers in shared memory as follows:
+
+```
+__shared__ float A_shared[BLOCK_DIM][BLOCK_DIM];
+__shared__ float B_shared[BLOCK_DIM][BLOCK_DIM];
+```
+
+Each block will have its own copy of these buffers. Hardware only supports
+a fixed amount of shared memory per block, and this varies by GPU.
+However, because shared memory must be allocated statically,
+your compiler will just fail if you try to allocate too much.
+This memory only exists for the lifetime of a particular thread block.
+
+In this example, we load *tiles* of `A` and `B` into shared memory as follows:
+
+```
+    for (uint32_t t = 0; t < N; t += BLOCK_DIM) {
+            
+        A_shared[threadIdx.y][threadIdx.x] = A[row * N + t + threadIdx.x];
+        B_shared[threadIdx.y][threadIdx.x] = B[(t + threadIdx.y) * N + col];
+        ...
+    }
+```
+
+At each tiled loop iteration, each thread is responsible for bringing a single
+value into GPU shared memory.
+After loading in a value, threads within a block must take a barrier: 
+
+```
+__syncthreads();
+```
+
+This is beacuse threads within an entire block do not necessarily run in lockstep.
+In order to continue to the next part of the algorithm (multiplying the `A` tile
+with the `B` tile), we must *know* that the *entire* `A` and `B` tiles have been
+loaded.
+
+After the intra-block `__syncthreads()` barrier, we can just go ahead and
+multiply the tiles:
+
+```
+for (uint32_t k = 0; k < BLOCK_DIM; k++) {
+    accum += A_shared[threadIdx.y][k] * B_shared[k][threadIdx.x];
+}
+```
+
+Note that all indices here are indices *into the shared memory*. They have
+*nothing* to do with the actual coordinates of the values within `A` and `B`.
 
 
 ### `3_matmul_tensorcore.cu`
 
 This is a counterexample-- for certain precisions (fp16, int8, on newer GPUs even fp64),
 there are *tensor cores* that provide high throughput matrix multiplications.
+Tensor cores are invoked using:
+
+```
+nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+```
 
 However, they are really hard to use! This is my attempt at using them, and it doesn't go super well.
 I will dedicate more time to this, but the point is that writing peak performance dense matrix
 multiplications is not totally trivial.
 
+
 ### `4_matmul_cublas.cu`
 
-But calling libraries is! cuBLAS achieves basically peak throughput with very little code.
+Calling libraries is much easier! cuBLAS achieves basically peak throughput with very little code.
 
 ### `5_gating_pytorch.py`
 
