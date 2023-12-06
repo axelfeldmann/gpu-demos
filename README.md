@@ -1,5 +1,7 @@
 # Talk/Demos: GPUs and Kernel Fusion
 
+Note: this is a work in progress
+
 ## Overview
 
 This repo is written to accompany a talk on GPUs and kernel fusion.
@@ -33,10 +35,97 @@ Once `A_device`, `B_device`, and `C_device` have been allocated on the GPU,
 we use `cudaMemcpy` to transfer over the actual values of `A` and `B`.
 Note that this `cudaMemcpy` is very slow compared to most other GPU operations.
 
-Fundamentally, the CUDA programming model is built around a grid of `blocks`. Each
+All computation on the GPU happens in *kernels*. We can think of kernels
+as "functions that execute on the GPU." In turn, kernels are composed of
+a grid of `blocks`. Each
 block is in turn made up of multiple `threads`.
+CUDA programmers must specify grid and thread block dimensions when ``launching" (invoking)
+a kernel. We can see a rough illustration of this grid and block stuff here:
 
 ![](./cuda-grid.png)
+
+*All* of a kernel's thread execute the same code. This is not as limiting as it may seem!
+Each thread also has access to its own specific values of 
+`blockIdx.x`, `blockIdx.y`, `threadIdx.x`, `threadIdx.y`.
+So in theory, it'd be possible to do:
+```
+if (threadIdx.x == 0 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    // some code
+} else if (threadIdx.x == 1 && threadIdx.y == 0 && blockIdx.x == 0 && blockIdx.y == 0) {
+    // some other code
+} else if (...) {
+    ...
+}
+```
+In practice, this would be *extremely* inefficient. In most kernels that I am aware of,
+threads tend to do relatively similar things.
+
+In `1_matmul_basic.cu`, I have *decided* (this is not forced by CUDA, 
+this is a programmer decision!) to make each thread responsible for calculating
+a single output entry of `C`. So, each thread `x, y` is responsible for computing
+`C[y,x] = dot(A[y,:], B[:,x])`.
+With this in mind, we can start to divide up our grid. We want a single thread
+per each entry of `C`, so we want an `N x N` overall grid of threads.
+
+One question might be: why not just put them all in the same block?
+The hardware limits the size of a single threadblock to `1024` threads.
+So, I opted to make each block `32 x 32`, and then make a grid of `(N / 32) x (N / 32)`
+blocks.
+
+Note the code defining all of this:
+
+```
+dim3 block_dim(BLOCK_DIM, BLOCK_DIM);
+dim3 grid_dim(N / BLOCK_DIM, N / BLOCK_DIM);
+```
+
+The actual kernel launch happens here:
+
+```
+matrix_multiply<<<grid_dim, block_dim>>>(A_device, B_device, C_device, N);
+```
+
+With the `grid_dim` and `block_dim` as "CUDA parameters". They sort of look like
+template parameters, but they're not.
+
+OK, now let's go look at what actually happens inside this kernel:
+
+```
+__global__ void matrix_multiply(float* A, float* B, float* C, size_t N) {
+
+    // Calculate row and column of C to work on
+    uint32_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    uint32_t col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Calculate C[row][col]
+    float accum = 0.0f;
+    for (uint32_t i = 0; i < N; i++) {
+        accum += A[row * N + i] * B[i * N + col];
+    }
+    C[row * N + col] = accum;
+}
+```
+
+The first thing that happens inside the kernel is that the thread needs to figure out
+who it is. Remember: all threads are running the same code-- so, using the magic 
+`blockIdx` and `threadIdx` structs is the only way that threads can figure out
+where they exist within the grid.
+
+Once a thread has figured out its row and column within the `C` matrix,
+it simply executes a dot product in a quite straightforward `C/C++` way.
+Basically, most of the code inside of a kernel is super standard `C/C++`,
+except that you need to keep in mind that it is being executed concurrently 
+with tons of other threads in the same kernel!
+
+NOTE: thread blocks and grids can actually be 3 dimensional, but that's a trivial extension
+to everything written above. Also, note that in general, dimensions are a "programmer 
+convenience"
+feature. It'd be perfectly possible to just have `threadIdx.x` and do the following:
+
+```
+int threadIdx_x = threadIdx.x % blockDim.x
+int threadIdx_y = threadIdx.x / blockDim.x
+```
 
 ### `2_matmul_sharedmem.cu`
 
