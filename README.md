@@ -63,7 +63,10 @@ threads tend to do relatively similar things.
 In `1_matmul_basic.cu`, I have *decided* (this is not forced by CUDA, 
 this is a programmer decision!) to make each thread responsible for calculating
 a single output entry of `C`. So, each thread `x, y` is responsible for computing
-`C[y,x] = dot(A[y,:], B[:,x])`.
+`C[y,x] = dot(A[y,:], B[:,x])`. (To see an alternate choice, you can look at
+`bonus_matmul_A_stationary.cu` where we make each thread responsible for all multiplications
+involving a single entry of `A` instead!)
+
 With this in mind, we can start to divide up our grid. We want a single thread
 per each entry of `C`, so we want an `N x N` overall grid of threads.
 
