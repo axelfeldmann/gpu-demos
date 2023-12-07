@@ -5,7 +5,7 @@ env = Environment(ENV=os.environ)
 env.Append(CXX='nvcc')
 
 # Custom builder for CUDA files
-cuda_build = Builder(action='nvcc -o $TARGET $SOURCES -O3 -lcublas')
+cuda_build = Builder(action='nvcc -o $TARGET $SOURCES -O3 -lcublas -arch=sm_70')
 env.Append(BUILDERS={'CudaBuild': cuda_build})
 
 # Find all .cu files

@@ -6,86 +6,73 @@
 #include <mma.h>
 #include <cassert>
 
-constexpr uint32_t WARPSIZE = 32;
-constexpr uint32_t WMMA_DIM = 16;
-constexpr uint32_t WMMA_TILE_DIM = 4;
-constexpr uint32_t TILE_DIM = WMMA_DIM * WMMA_TILE_DIM;
+__launch_bounds__(512) __global__ void half_precision_gemm(half* A, half* B, float* C, size_t N) {
 
-// Perform matrix multiplication C = A * B using the tensor cores
-// This is not a good implementation!
-__global__ void half_precision_gemm(half* A, half* B, float* C, size_t N) {
+    int global_block_row = blockIdx.y;
+    int global_block_col = blockIdx.x;
 
-    // Warp x and warp y describe the position of the warp's C tile in C
-    uint32_t x = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t warp_x = x / WARPSIZE;
-    uint32_t y = blockIdx.y * blockDim.y + threadIdx.y;
-    uint32_t warp_y = y;
-    uint32_t lane = threadIdx.x % WARPSIZE;
+    int local_warp_row = threadIdx.x / 32;
+    int local_warp_col = threadIdx.y;
 
-    // Local warp x and local warp y describe the position of the thread's C fragment
-    // in the warp's C tile
-    uint32_t local_warp_x = threadIdx.x / WARPSIZE;
-    uint32_t local_warp_y = threadIdx.y;
+    int global_warp_row = global_block_row + local_warp_row;
+    int global_warp_col = global_block_col + local_warp_col;
 
-    __shared__ half A_tile[TILE_DIM * TILE_DIM];
-    __shared__ half B_tile[TILE_DIM * TILE_DIM];
+    int lane = threadIdx.x % 32;
 
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_DIM, WMMA_DIM, WMMA_DIM, half, nvcuda::wmma::row_major> a_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_DIM, WMMA_DIM, WMMA_DIM, half, nvcuda::wmma::col_major> b_frag;
-    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_DIM, WMMA_DIM, WMMA_DIM, float> c_frag;
-    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+    extern __shared__ half buffer[];
+    half* A_tile = buffer;
+    half* B_tile = buffer + (128 * 128);
 
-    uint32_t load_col = local_warp_x / 2;
-    uint32_t load_row = 2 * local_warp_y + local_warp_x % 2;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, 16, 16, 16, half, nvcuda::wmma::row_major> a_frag[2][2];
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, 16, 16, 16, half, nvcuda::wmma::col_major> b_frag[2][2];
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, 16, 16, 16, float> c_frag[2][2];
 
-    for (uint32_t k = 0; k < N; k += TILE_DIM) {
-        
-        // Each thread is responsible for helping load 8 elements of A and B
-        // into its warp's shared memory tile
-        for (uint32_t i = 0; i < 8; i++) {
-            // Load A[warp_x + load_row * 8 + i][k + load_col * WARP_SIZE + lane] into
-            // A_tile[load_row * 8 + i][load_col * WARP_SIZE + lane]
-            uint32_t a_row = warp_x + load_row * 8 + i;
-            uint32_t a_col = k + load_col * WARPSIZE + lane;
-            uint32_t a_index = a_row * N + a_col;
-
-            uint32_t a_tile_row = load_row * 8 + i;
-            uint32_t a_tile_col = load_col * WARPSIZE + lane;
-            uint32_t a_tile_index = a_tile_row * TILE_DIM + a_tile_col;
-
-            A_tile[a_tile_index] = A[a_index];
-
-            // Load B[k + load_row * 8 + i][warp_y + load_col * WARP_SIZE + lane] into
-            // B_tile[load_row * 8 + i][load_col * WARP_SIZE + lane]
-            uint32_t b_row = k + load_row * 8 + i;
-            uint32_t b_col = warp_y + load_col * WARPSIZE + lane;
-            uint32_t b_index = b_row * N + b_col;
-
-            uint32_t b_tile_row = load_row * 8 + i;
-            uint32_t b_tile_col = load_col * WARPSIZE + lane;
-            uint32_t b_tile_index = b_tile_row * TILE_DIM + b_tile_col;
-
-            B_tile[b_tile_index] = B[b_index];
+    for (int my_row = 0; my_row < 2; my_row++) {
+        for (int my_col = 0; my_col < 2; my_col++) {
+            nvcuda::wmma::fill_fragment(c_frag[my_row][my_col], 0.0f);
         }
+    }
 
+    for (int k = 0; k < N; k += 128) {
+
+        for (int j = 0; j < 32; j++) {
+            // load row of A tile
+            int local_A_row = local_warp_row * 32 + j;
+            int local_A_col = local_warp_col * 32 + lane;
+
+            int global_A_row = global_block_row * 32 + j;
+            int global_A_col = k + local_A_col;
+
+            A_tile[local_A_row * 128 + local_A_col] = A[global_A_row * N + global_A_col];
+            B_tile[local_A_row * 128 + local_A_col] = B[global_A_row * N + global_A_col];
+        }
         __syncthreads();
 
-        // Load fragments from shared memory
-        for (uint32_t kk = 0; kk < WMMA_TILE_DIM; kk++) {
+        for (int my_row = 0; my_row < 2; my_row++) {
+            for (int my_col = 0; my_col < 2; my_col++) {
 
-            uint32_t A_tile_index = local_warp_y * TILE_DIM * WMMA_DIM + WMMA_DIM * kk;
-            uint32_t B_tile_index = kk * TILE_DIM * WMMA_DIM + WMMA_DIM * local_warp_x;
-            
-            nvcuda::wmma::load_matrix_sync(a_frag, &A_tile[A_tile_index], TILE_DIM);
-            nvcuda::wmma::load_matrix_sync(b_frag, &B_tile[B_tile_index], TILE_DIM);
-            nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+                for (int kk = 0; kk < 8; kk++) {
+                    int local_A_row = local_warp_row * 32 + my_row * 16;
+                    int local_A_col = kk * 16;
+
+                    int local_B_row = kk * 16;
+                    int local_B_col = local_warp_col * 32 + my_col * 16;
+
+                    nvcuda::wmma::load_matrix_sync(a_frag[my_row][my_col], &A_tile[local_A_row * 128 + local_A_col], 128);
+                    nvcuda::wmma::load_matrix_sync(b_frag[my_row][my_col], &B_tile[local_B_row * 128 + local_B_col], 128);
+                    nvcuda::wmma::mma_sync(c_frag[my_row][my_col], a_frag[my_row][my_col], b_frag[my_row][my_col], c_frag[my_row][my_col]);
+                }
+            }
         }
-
         __syncthreads();
     }
 
-    uint32_t c_index = warp_y * (WMMA_DIM * N) + warp_x * WMMA_DIM;
-    nvcuda::wmma::store_matrix_sync(&C[c_index], c_frag, N, nvcuda::wmma::mem_row_major);
+    for (int my_row = 0; my_row < 2; my_row++) {
+        for (int my_col = 0; my_col < 2; my_col++) {
+            int c_index = (global_warp_row * 32 + my_row * 16) * N + global_warp_col * 32 + my_col * 16;
+            nvcuda::wmma::store_matrix_sync(&C[c_index], c_frag[my_row][my_col], N, nvcuda::wmma::mem_row_major);
+        }
+    }
 }
 
 std::vector<half> float_to_half(const std::vector<float>& input) {
@@ -123,8 +110,11 @@ int main(int argc, char* argv[]) {
     cudaMemcpy(A_device_half, A_host_half.data(), N * N * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(B_device_half, B_host_half.data(), N * N * sizeof(half), cudaMemcpyHostToDevice);
 
-    dim3 block_dim(4 * WARPSIZE, 4); // Each block has 4x4 warps
-    dim3 grid_dim(N / (4 * WMMA_DIM), N / (4 * WMMA_DIM)); // Each block has 4x4 warps
+    dim3 block_dim(128, 4);
+    dim3 grid_dim(N / 128, N / 128);
+
+    int sharedmem_size = (64 << 10);
+    cudaFuncSetAttribute(half_precision_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedmem_size);
 
     // Time kernel
     cudaEvent_t start, stop;
@@ -132,7 +122,7 @@ int main(int argc, char* argv[]) {
     cudaEventCreate(&stop);
     cudaEventRecord(start);
 
-    half_precision_gemm<<<grid_dim, block_dim>>>(A_device_half, B_device_half, C_device_float, N);
+    half_precision_gemm<<<grid_dim, block_dim, sharedmem_size>>>(A_device_half, B_device_half, C_device_float, N);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
